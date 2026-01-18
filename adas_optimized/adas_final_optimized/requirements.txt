@@ -1,0 +1,18 @@
+# Optimized ADAS System Requirements
+
+# Core dependencies
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# For SegFormer (semantic segmentation)
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+
+# Optional but recommended
+scipy>=1.10.0
+pillow>=9.5.0
+
+# Tracking
+lap>=0.4.0
