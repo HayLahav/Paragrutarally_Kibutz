@@ -143,7 +143,8 @@ class LaneDetectorWithSegmentation:
         right_points = []
         
         y_start = int(h * 0.5)
-        for y in range(y_start, h, 5):
+        # Optimized: step=10 instead of 5
+        for y in range(y_start, h, 10):
             if y >= h_mask:
                 continue
             
