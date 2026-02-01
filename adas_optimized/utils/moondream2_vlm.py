@@ -240,7 +240,7 @@ class Moondream2Lite:
     def is_available(self):
         return self.model is not None
     
-    def analyze_frame(self, frame, frame_num, tracks=None, motion_context=None, prev_frame=None):
+    def analyze_frame(self, frame, frame_num, tracks=None):
         """Analyze with single hazard detection query"""
         if not self.is_available():
             return {
@@ -261,60 +261,18 @@ class Moondream2Lite:
         
         # Build context from tracking data
         context = ""
-        if motion_context:
-            context += f"Ego-Vehicle: {motion_context}. "
-            
         if tracks:
-            # Use velocity if available
-            moving = 0
-            stationary = 0
-            for t in tracks:
-                if hasattr(t, 'get_velocity'):
-                    vel = t.get_velocity()
-                    speed = (vel[0]**2 + vel[1]**2)**0.5
-                    if speed > 1.5: # Pixel speed threshold
-                        moving += 1
-                    else:
-                        stationary += 1
-                elif hasattr(t, 'velocity'): # Fallback
-                    if abs(t.velocity) > 0.5:
-                        moving += 1
-                    else:
-                        stationary += 1
-            
+            moving = sum(1 for t in tracks if hasattr(t, 'velocity') and abs(t.velocity) > 0.5)
+            stationary = sum(1 for t in tracks if hasattr(t, 'velocity') and abs(t.velocity) < 0.2)
             if moving > 0 or stationary > 0:
-                context += f"Detected Objects: {moving} moving, {stationary} parked/stationary. "
+                context = f"Context: {moving} moving, {stationary} parked. "
         
-        # Prepare image
-        if prev_frame is not None:
-            # Create side-by-side composite (Left: Past, Right: Present)
-            # Resize both to fit better in VLM input (usually 378x378 or 720p)
-            h, w = frame.shape[:2]
-            small_w, small_h = w // 2, h // 2
-            
-            img_curr = cv2.resize(frame, (small_w, small_h))
-            img_prev = cv2.resize(prev_frame, (small_w, small_h))
-            
-            # Stack horizontally
-            composite = np.hstack([img_prev, img_curr])
-            
-            # Add labels
-            cv2.putText(composite, "PAST", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.putText(composite, "PRESENT", (small_w + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            rgb = cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb)
-            
-            # Adjust query for dual-frame
-            base_query = "This image shows two frames from a dashcam (Left: PAST, Right: PRESENT). Compare them. "
-        else:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb)
-            base_query = ""
+        # Convert and process
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb)
         
         t_start = time.time()
-        query = base_query + context + "Identify vehicles that are moving vs parked. Describe road hazards with location and distance. Give instructions for the driver."
-        
+        query = context + "Describe road hazards with location and distance: turns, bumps, intersections, obstacles, vehicles. Example: 'Silver sedan 4m ahead. Road curves right 20m ahead.'"
         result = self.model.query(
             pil_image,
             query,
