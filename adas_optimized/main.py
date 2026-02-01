@@ -36,8 +36,6 @@ from utils.lane_detector import LaneDetectorWithSegmentation
 from utils.distance_estimator import DistanceEstimator
 from utils.collision_detector import CollisionDetector, WarningLevel
 from utils.video_stabilizer import SimpleVideoStabilizer
-# from utils.bumper_detector import BumperDetector, LicensePlateDetector  # Removed - Moondream2 will handle
-# from utils.speed_bump_detector import SpeedBumpDetector  # Disabled - will use Moondream2
 from utils.segformer_segmentation import SegFormerSegmentation
 
 try:
@@ -565,7 +563,56 @@ class ADASSystem:
         # 10. Moondream2 VLM Analysis (if enabled)
         t0 = time.time()
         if self.use_vlm and self.vlm and self.vlm.is_available():
-            vlm_result = self.vlm.analyze_frame(frame, self.frame_count, tracks=tracks)
+            # Determine motion state from stabilizer stats
+            motion_context = "Stationary"
+            if 'stabilization' in results and results['stabilization']:
+                stab = results['stabilization']
+                dx = stab.get('dx', 0)
+                dy = stab.get('dy', 0)
+                # Simple motion magnitude
+                motion_mag = (dx**2 + dy**2)**0.5
+                
+                # Update history (keep last 30 frames ~ 1 sec)
+                if not hasattr(self, 'motion_history'):
+                    self.motion_history = []
+                self.motion_history.append(motion_mag)
+                if len(self.motion_history) > 30:
+                    self.motion_history.pop(0)
+                
+                # Check average motion
+                avg_motion = sum(self.motion_history) / max(1, len(self.motion_history))
+                
+                # Thresholds for state (pixels per frame)
+                # Driving usually implies significant flow or vibration/correction
+                # Parking (slow maneuvering) might also have motion, but "Stationary" is very low.
+                # Let's distinguish:
+                # - High avg motion (>5 px): Driving/Turning
+                # - Low avg motion (<2 px): Stationary/Stable
+                # - Medium: Parking/Slow Maneuver
+                
+                if avg_motion > 5.0:
+                    motion_context = "DRIVING (Active Motion)"
+                elif avg_motion > 1.0:
+                    motion_context = "PARKING/SLOW MANEUVER"
+                else:
+                    motion_context = "STATIONARY/IDLE"
+            
+            # For temporal comparison, pass a frame from the past
+            # We use the frame from exactly one VLM skip interval ago
+            prev_frame = getattr(self, 'prev_vlm_frame', None)
+            
+            vlm_result = self.vlm.analyze_frame(
+                frame, 
+                self.frame_count, 
+                tracks=tracks, 
+                motion_context=motion_context,
+                prev_frame=prev_frame
+            )
+            
+            # Update the reference frame for the next VLM cycle
+            if not vlm_result.get('cached', False):
+                self.prev_vlm_frame = frame.copy()
+                
             results['vlm'] = vlm_result
         else:
             results['vlm'] = None
@@ -576,7 +623,7 @@ class ADASSystem:
         self.total_time += results['processing_time']
         self.frame_count += 1
         
-        return results
+        return results, frame
     
     def _calculate_steering(self, left_lane, right_lane, img_width, img_height):
         """Calculate steering from lanes"""
@@ -650,18 +697,18 @@ class ADASSystem:
         plates = results.get('license_plates', [])
         speed_bumps = results.get('speed_bumps', [])
         
+        # Single overlay buffer for all transparent elements
+        overlay_mask = np.zeros_like(output)
+        
         # 1. Draw road segmentation overlay (ROAD ONLY, not sidewalks)
         road_mask = extra_data.get('road_mask')
         if road_mask is not None:
             # Create purple overlay for road only
-            road_overlay = np.zeros_like(output)
-            road_overlay[road_mask > 0] = [128, 64, 128]  # Purple for road
-            output = cv2.addWeighted(output, 0.7, road_overlay, 0.3, 0)
+            overlay_mask[road_mask > 0] = [128, 64, 128]  # Purple for road
         
         # 2. Draw filled lane area
         if left_lane is not None and right_lane is not None:
             num_points = min(len(left_lane), len(right_lane))
-            
             lane_poly = np.vstack([
                 left_lane[:num_points],
                 right_lane[:num_points][::-1]
@@ -669,22 +716,28 @@ class ADASSystem:
             
             if detection_mode == 'lanes':
                 fill_color = (0, 200, 0)
-                boundary_color = (0, 255, 0)
-                center_color = (255, 255, 0)
             elif detection_mode == 'bisenet':
                 fill_color = (200, 100, 0)
-                boundary_color = (255, 150, 0)
-                center_color = (255, 200, 0)
             else:
                 fill_color = (0, 150, 200)
+            
+            cv2.fillPoly(overlay_mask, [lane_poly], fill_color)
+        
+        # Apply single blend for road surface and lane fill
+        # Only blend where we actually drew something
+        mask_indices = np.any(overlay_mask > 0, axis=2)
+        if np.any(mask_indices):
+            output[mask_indices] = cv2.addWeighted(output[mask_indices], 0.7, overlay_mask[mask_indices], 0.3, 0)
+        
+        # 3. Draw Lane Lines (Solid, not transparent)
+        if left_lane is not None and right_lane is not None:
+            if detection_mode == 'lanes':
+                boundary_color = (0, 255, 0)
+            elif detection_mode == 'bisenet':
+                boundary_color = (255, 150, 0)
+            else:
                 boundary_color = (0, 200, 255)
-                center_color = (0, 255, 255)
-            
-            # Filled polygon disabled for performance (~100ms savings)
-            # overlay = output.copy()
-            # cv2.fillPoly(overlay, [lane_poly], fill_color)
-            # output = cv2.addWeighted(output, 0.75, overlay, 0.25, 0)
-            
+
             if detection_mode == 'lanes':
                 cv2.polylines(output, [left_lane.astype(np.int32)], False, boundary_color, 3)
                 cv2.polylines(output, [right_lane.astype(np.int32)], False, boundary_color, 3)
@@ -940,8 +993,8 @@ def main():
             if not ret:
                 break
             
-            results = system.process_frame(frame)
-            output = system.visualize(frame, results)
+            results, stabilized_frame = system.process_frame(frame)
+            output = system.visualize(stabilized_frame, results)
             
             if writer:
                 writer.write(output)
